@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -24,6 +25,43 @@ from homeassistant.util.color import color_hsv_to_RGB, color_RGB_to_hsv
 
 from .coordinator import PhilipsTVConfigEntry, PhilipsTVDataUpdateCoordinator
 from .entity import PhilipsJsEntity
+
+LOGGER = logging.getLogger(__name__)
+
+# Ambilight brightness via menuitems API (verified 2026-05-25 by probing
+# the 8 ambilight nodeids the official Android app queries). Node 710 is
+# MLM_PHM_KEY_PC_ID_BRIGH_L12 with a single `value` field, range 0-9
+# (current/default = 5). This is the only way to scale ambilight brightness
+# without leaving the current style/preset — the cached-pixel path bakes
+# brightness into the RGB values but only works while in expert mode, and
+# the colorSettings.color["brightness"] read-back is stale on API 6.x. The
+# Android app uses this node + posts the same way for its slider.
+_AMBILIGHT_BRIGHTNESS_NODEID = 710
+_AMBILIGHT_BRIGHTNESS_TV_MAX = 9
+
+# Persistent style selection via menuitems (verified 2026-05-25). Node 300
+# (MLM_PHM_KEY_MAIN_AMBILIGHT_STYLE) holds an `activenode_id` field which
+# points to one of the child style nodes (320/330/340/310 = OFF). When
+# activenode_id == 0 the TV is in "API-driven" / Follow App mode — which is
+# what setAmbilightCurrentConfiguration leaves it in, and what causes
+# rwjack's "TV reverts to my original Fixed Color on power cycle even
+# though menu shows Follow App" report on #156776 (the TV remembers a
+# separate persistent default that the API doesn't update).
+# Setting activenode_id to a real parent node makes the TV's persistent
+# state match what HA selected, so it survives power cycles.
+_AMBILIGHT_STYLE_PARENT_NODE = 300
+_STYLE_TO_PARENT_NODE: dict[str, int] = {
+    "FOLLOW_VIDEO": 320,
+    "FOLLOW_AUDIO": 330,
+    "FOLLOW_COLOR": 340,
+    # "OFF": 310 — not parallel-written from turn_off (our turn_off uses
+    #   cached zeros, not styleName=OFF; persisting OFF would change the
+    #   user's preferred "on" style on power cycle, which they probably
+    #   don't want).
+    # "FOLLOW_APP": 360 — that's the "API-driven" mode; we WANT to leave
+    #   it as the API-driven mode by NOT writing to node 300 for these.
+    # "MANUAL": no node mapping documented.
+}
 
 EFFECT_PARTITION = ": "
 EFFECT_MODE = "Mode"
@@ -88,6 +126,26 @@ PRETTY_LABELS: dict[tuple[str, str | None], str] = {
 }
 PRETTY_TO_KEY = {v: k for k, v in PRETTY_LABELS.items()}
 PRETTY_CUSTOM = "Custom"  # shown when TV is in expert mode (color picker)
+
+# When the TV receives setAmbilightCurrentConfiguration({styleName: X,
+# isExpert: false}), it auto-derives its internal mode from styleName.
+# Verified mappings from direct probing (see MemPalace
+# home-assistant/philips-integration/api-patterns):
+#   FOLLOW_VIDEO / FOLLOW_AUDIO → "internal"
+#   FOLLOW_COLOR                → "lounge"
+# The haphilipsjs library tracks ambilight_current_configuration after the
+# POST but NOT ambilight_mode_raw, which leaves the cached mode stale and
+# causes gating decisions in turn_off / turn_on / color_worker that read
+# ambilight_mode_raw to use wrong values (manifests as the "turn on/off
+# needs second press" bug — cache says "expert" but TV is actually in
+# "internal"/"lounge", so cached pixel writes are silently ignored).
+_STYLE_TO_AUTO_MODE: dict[str, str] = {
+    "FOLLOW_VIDEO": "internal",
+    "FOLLOW_AUDIO": "internal",
+    "FOLLOW_COLOR": "lounge",
+    # Other styleNames (OFF, FOLLOW_APP, MANUAL, etc.) — leave cache as-is.
+    # We don't have verified data on their auto-derived mode.
+}
 
 
 def _pretty_label(effect: AmbilightEffect) -> str:
@@ -324,15 +382,19 @@ class PhilipsTVLightEntity(PhilipsJsEntity, LightEntity):
 
     @property
     def color_mode(self) -> ColorMode:
-        """Return the current color mode."""
-        current = self._tv.ambilight_current_configuration
-        if current and current["isExpert"]:
-            return ColorMode.HS
+        """Return the current color mode.
 
-        if self._tv.ambilight_mode in ["manual", "expert"]:
-            return ColorMode.HS
+        Always ColorMode.HS now that brightness works on presets too via
+        menuitems node 710 (and color wheel still triggers expert-mode
+        cached pixels). Returning ONOFF for presets — which the upstream
+        code did — caused HA to hide the brightness slider entirely on
+        any preset effect, making brightness control inaccessible.
 
-        return ColorMode.ONOFF
+        hs_color may legitimately be None on a preset (no single color
+        to report), which HA handles fine. The wheel still shows a
+        default-positioned indicator and touching it switches to expert.
+        """
+        return ColorMode.HS
 
     @property
     def is_on(self) -> bool:
@@ -369,21 +431,42 @@ class PhilipsTVLightEntity(PhilipsJsEntity, LightEntity):
         if effect.is_on(self._tv.powerstate):
             self._last_selected_effect = effect
 
+        # Brightness: ALWAYS prefer _last_painted_brightness over the TV's
+        # reported colorSettings.color["brightness"] because the latter is
+        # stale on this firmware (doesn't reflect cached writes or the
+        # menuitems brightness node). Without this preference, the slider
+        # snaps back every coordinator poll — rwjack's "HA state resets to
+        # 1% just by switching tabs" symptom in #156776.
         if effect.mode == EFFECT_EXPERT and color:
             self._attr_hs_color = (
                 color["hue"] * 360.0 / 255.0,
                 color["saturation"] * 100.0 / 255.0,
             )
-            self._attr_brightness = color["brightness"]
+            self._attr_brightness = (
+                self._last_painted_brightness
+                if self._last_painted_brightness is not None
+                else color["brightness"]
+            )
         elif effect.mode == EFFECT_MODE and self._tv.ambilight_cached:
             hsv_h, hsv_s, hsv_v = color_RGB_to_hsv(
                 *_average_pixels(self._tv.ambilight_cached)
             )
             self._attr_hs_color = hsv_h, hsv_s
-            self._attr_brightness = hsv_v * 255.0 / 100.0
+            self._attr_brightness = (
+                self._last_painted_brightness
+                if self._last_painted_brightness is not None
+                else hsv_v * 255.0 / 100.0
+            )
         else:
+            # On a preset (EFFECT_AUTO) the TV doesn't expose a per-preset
+            # color, but we DO have brightness via the menuitems API (node
+            # 710, MLM_PHM_KEY_PC_ID_BRIGH_L12, range 0-9). The slider
+            # reflects _last_painted_brightness, which is set by both the
+            # color-worker path (expert) and the menuitems-brightness path
+            # (presets) — so it persists across coordinator polls regardless
+            # of which control the user last touched.
             self._attr_hs_color = None
-            self._attr_brightness = None
+            self._attr_brightness = self._last_painted_brightness
 
     @callback
     def _handle_coordinator_update(self) -> None:
@@ -431,7 +514,7 @@ class PhilipsTVLightEntity(PhilipsJsEntity, LightEntity):
                     # "manual" is untested so we conservatively keep the
                     # unstick for it too.
                     if self._tv.ambilight_mode_raw not in ("expert", "internal"):
-                        await self._tv.setAmbilightCurrentConfiguration({
+                        await self._set_current_config({
                             "styleName": "FOLLOW_VIDEO",
                             "isExpert": False,
                             "menuSetting": "STANDARD",
@@ -534,7 +617,7 @@ class PhilipsTVLightEntity(PhilipsJsEntity, LightEntity):
             config["audioSettings"] = setting
             config["tuning"] = 0
 
-        if not await self._tv.setAmbilightCurrentConfiguration(config):
+        if not await self._set_current_config(config):
             raise HomeAssistantError("Failed to set ambilight mode")
         self._last_set_config = config
 
@@ -546,9 +629,125 @@ class PhilipsTVLightEntity(PhilipsJsEntity, LightEntity):
             "menuSetting": effect.algorithm,
         }
 
-        if await self._tv.setAmbilightCurrentConfiguration(config) is False:
+        if await self._set_current_config(config) is False:
             raise HomeAssistantError("Failed to set ambilight mode")
         self._last_set_config = config
+
+    async def _set_menuitems_active_style(self, style_name: str | None) -> None:
+        """Parallel-write the TV's persistent ambilight style via menuitems.
+
+        Without this, setAmbilightCurrentConfiguration only writes the
+        session-state style. The TV maintains a separate `activenode_id`
+        in node 300 that survives power cycles — when it's 0 (API-driven),
+        the TV reverts to its menu-set default on next boot. By writing
+        the parent node ID here (320 for FOLLOW_VIDEO, 330 for FOLLOW_AUDIO,
+        340 for FOLLOW_COLOR), the TV's persistent state matches HA's
+        intent — addressing rwjack's "TV uses original Fixed Color on power
+        cycle even though menu shows Follow App" report in #156776.
+
+        Silent no-op for styleName values we don't have a mapping for
+        (OFF, FOLLOW_APP, MANUAL) — those leave the persistent state alone.
+        """
+        parent_node = _STYLE_TO_PARENT_NODE.get(style_name) if style_name else None
+        if parent_node is None:
+            return
+        payload = {
+            "values": [
+                {
+                    "value": {
+                        "Nodeid": _AMBILIGHT_STYLE_PARENT_NODE,
+                        "data": {"activenode_id": parent_node},
+                    }
+                }
+            ]
+        }
+        result = await self._tv.postReq("menuitems/settings/update", payload)
+        if result is None:
+            # Don't raise — this is a polish/persistence concern, not
+            # essential to the operation succeeding. Log and continue.
+            LOGGER.warning(
+                "menuitems persistent-style sync failed for %s (parent=%d)",
+                style_name, parent_node,
+            )
+        else:
+            LOGGER.debug(
+                "menuitems persistent style: %s → node 300 activenode_id=%d",
+                style_name, parent_node,
+            )
+
+    async def _set_menuitems_brightness(self, ha_brightness: int) -> None:
+        """POST ambilight brightness via the TV's menuitems settings API.
+
+        Scales HA's 0-255 brightness to the TV's 0-9 range (node 710). This
+        is the same path the official Android Ambilight app uses for its
+        brightness slider, and it's the only way to scale brightness
+        without leaving the current preset / style.
+
+        The library doesn't expose a wrapper for this — we go directly via
+        postReq. Maps HA 0→TV 1 (the slider min is usually 1, treating 0
+        as "min visible" rather than "off") through HA 255→TV 9.
+        """
+        # Map: HA 1..255 → TV 1..9, with HA 0 also → TV 1 (don't hit zero,
+        # which on some TVs equals "off" for the menuitems brightness path).
+        ha_clamped = max(1, min(255, int(ha_brightness)))
+        tv_value = max(1, round(ha_clamped * _AMBILIGHT_BRIGHTNESS_TV_MAX / 255))
+        payload = {
+            "values": [
+                {
+                    "value": {
+                        "Nodeid": _AMBILIGHT_BRIGHTNESS_NODEID,
+                        "data": {"value": tv_value},
+                    }
+                }
+            ]
+        }
+        result = await self._tv.postReq("menuitems/settings/update", payload)
+        if result is None:
+            raise HomeAssistantError(
+                f"Failed to set ambilight brightness to {tv_value}/9 via menuitems"
+            )
+        LOGGER.debug(
+            "Set ambilight brightness via menuitems: HA %d → TV %d/9",
+            ha_brightness, tv_value,
+        )
+
+    async def _set_current_config(self, cfg: dict) -> bool | None:
+        """setAmbilightCurrentConfiguration + sync the cached mode_raw.
+
+        The haphilipsjs library updates ambilight_current_configuration
+        after this POST but does NOT update ambilight_mode_raw, even
+        though the TV auto-derives its mode from the styleName. Without
+        this sync, gating decisions in async_turn_off / async_turn_on /
+        _color_worker_loop that read self._tv.ambilight_mode_raw will use
+        a stale value, leading to the "turn on/off needs second press"
+        bug — cache says we're in "expert" so the unstick + setAmbilightMode
+        steps are skipped, but the TV is actually in "internal" or "lounge"
+        (after a prior setAmbilightCurrentConfiguration that auto-flipped
+        mode) and silently ignores subsequent cached pixel writes.
+
+        isExpert:true configs are silently ignored by the TV per
+        api-patterns (the TV doesn't render from them), so they don't
+        change the mode either — skip the sync for those.
+        """
+        result = await self._tv.setAmbilightCurrentConfiguration(cfg)
+        if result is not False and not cfg.get("isExpert"):
+            style_name = cfg.get("styleName")
+            derived = _STYLE_TO_AUTO_MODE.get(style_name)
+            if derived is not None:
+                self._tv.ambilight_mode_raw = derived
+            # NOTE: parallel-writing menuitems node 300 activenode_id to
+            # persist style across power cycles was attempted and reverted
+            # 2026-05-25 — see [[home-assistant/philips-integration]]
+            # (persistent-style-attempt-reverted). The menuitems API only
+            # exposes "Fixed Colour" as the FOLLOW_COLOR sub-style; setting
+            # activenode_id=340 silently switches the TV from the
+            # currentconfiguration-set lounge preset (Hot Lava etc.) to
+            # Fixed Colour with the TV's stored default color (blue on this
+            # firmware). Same risk for VIDEO/AUDIO families where the
+            # selected_item enums are incomplete. Restoring persistence
+            # without this regression requires a full sub-style enum map
+            # for every style family — out of scope for now.
+        return result
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         """Turn the bulb on."""
@@ -600,7 +799,7 @@ class PhilipsTVLightEntity(PhilipsJsEntity, LightEntity):
                     # internal_invalid quirk in haphilipsjs.
                     cfg = snap.get("config")
                     if cfg:
-                        if await self._tv.setAmbilightCurrentConfiguration(cfg) is False:
+                        if await self._set_current_config(cfg) is False:
                             raise HomeAssistantError("Failed to restore ambilight configuration")
                 else:
                     # Snapshot was lost (e.g. consumed by a racing call before
@@ -608,7 +807,7 @@ class PhilipsTVLightEntity(PhilipsJsEntity, LightEntity):
                     # turn_on would call setAmbilightMode("internal") which
                     # triggers the broken internal_invalid quirk on API 6.x.
                     # Use a safe default that we know works: FOLLOW_VIDEO/STANDARD.
-                    if await self._tv.setAmbilightCurrentConfiguration({
+                    if await self._set_current_config({
                         "styleName": "FOLLOW_VIDEO",
                         "isExpert": False,
                         "menuSetting": "STANDARD",
@@ -639,6 +838,37 @@ class PhilipsTVLightEntity(PhilipsJsEntity, LightEntity):
             # would cause drift. Use _last_painted_* (what we actually wrote
             # last) as the baseline.
             if ATTR_HS_COLOR in kwargs or ATTR_BRIGHTNESS in kwargs:
+                # Brightness-only change on a preset effect: route via the
+                # menuitems brightness node (710, MLM_PHM_KEY_PC_ID_BRIGH_L12).
+                # This is what the official Android Ambilight app uses for
+                # brightness. Without this, falling through to the worker
+                # would paint cached pixels using _last_painted_hs (default
+                # (0,0) = white) for the unset color → user's preset (e.g.
+                # Hot Lava) snaps to white AND switches the TV out of lounge.
+                # The menuitems route keeps the preset intact and actually
+                # changes the LED brightness.
+                brightness_only = (
+                    ATTR_BRIGHTNESS in kwargs
+                    and ATTR_HS_COLOR not in kwargs
+                )
+                if brightness_only:
+                    current_effect = _label_to_effect(self._attr_effect or "")
+                    if current_effect.mode != EFFECT_EXPERT:
+                        new_brightness = int(kwargs[ATTR_BRIGHTNESS])
+                        try:
+                            await self._set_menuitems_brightness(new_brightness)
+                        except Exception as err:  # noqa: BLE001
+                            LOGGER.warning(
+                                "menuitems brightness POST failed (%s); "
+                                "falling back to optimistic slider only", err
+                            )
+                        # Update HA state regardless — slider should reflect
+                        # the user's intent even if the TV write failed.
+                        self._last_painted_brightness = new_brightness
+                        self._attr_brightness = new_brightness
+                        self.async_write_ha_state()
+                        return
+
                 hs_color = kwargs.get(ATTR_HS_COLOR)
                 if hs_color is None:
                     hs_color = self._last_painted_hs or (0, 0)
@@ -672,7 +902,7 @@ class PhilipsTVLightEntity(PhilipsJsEntity, LightEntity):
                 elif effect.mode == EFFECT_MODE:
                     # The "internal"/"manual" route triggers the broken
                     # internal_invalid quirk on API 6.x. Fall back to default.
-                    if await self._tv.setAmbilightCurrentConfiguration({
+                    if await self._set_current_config({
                         "styleName": "FOLLOW_VIDEO",
                         "isExpert": False,
                         "menuSetting": "STANDARD",
@@ -750,7 +980,7 @@ class PhilipsTVLightEntity(PhilipsJsEntity, LightEntity):
                 "menuSetting": "STANDARD",
             }
             if self._tv.ambilight_mode_raw not in ("expert", "internal"):
-                if await self._tv.setAmbilightCurrentConfiguration(unstick) is False:
+                if await self._set_current_config(unstick) is False:
                     raise HomeAssistantError("Failed to break sticky lounge state")
             if self._tv.ambilight_mode_raw != "expert":
                 if await self._tv.setAmbilightMode("expert") is False:
